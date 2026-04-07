@@ -1,0 +1,189 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ─────────────────────────────────────────────
+// ENUMS
+// ─────────────────────────────────────────────
+
+enum Role {
+  ADMIN
+  MANAGER
+  INTERN
+}
+
+enum DocumentStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum InternStatus {
+  ACTIVE
+  COMPLETED
+  TERMINATED
+}
+
+// ─────────────────────────────────────────────
+// USER
+// ─────────────────────────────────────────────
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  password  String
+  name      String
+  phone     String?
+  avatar    String?
+  role      Role     @default(INTERN)
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Manager relationship – one user (MANAGER role) manages one department
+  managedDepartment Department? @relation("DepartmentManager")
+
+  // Intern profile linked to this user
+  internProfile Intern? @relation("InternUser")
+
+  // Manager profile linked to this user
+  managerProfile Manager? @relation("ManagerUser")
+
+  // Documents uploaded by this user
+  documents Document[]
+
+  @@map("users")
+}
+
+// ─────────────────────────────────────────────
+// DEPARTMENT
+// ─────────────────────────────────────────────
+
+model Department {
+  id          String  @id @default(cuid())
+  name        String  @unique
+  description String?
+  isActive    Boolean @default(true)
+
+  // A department has one assigned manager (User with MANAGER role)
+  managerId String? @unique
+  manager   User?   @relation("DepartmentManager", fields: [managerId], references: [id], onDelete: SetNull)
+
+  interns   Intern[]
+  managers  Manager[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("departments")
+}
+
+// ─────────────────────────────────────────────
+// MANAGER PROFILE
+// ─────────────────────────────────────────────
+
+model Manager {
+  id           String  @id @default(cuid())
+  userId       String  @unique
+  user         User    @relation("ManagerUser", fields: [userId], references: [id], onDelete: Cascade)
+  employeeId   String? @unique
+  designation  String?
+  departmentId String?
+  department   Department? @relation(fields: [departmentId], references: [id], onDelete: SetNull)
+
+  // Interns assigned to this manager
+  interns Intern[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("managers")
+}
+
+// ─────────────────────────────────────────────
+// INTERN PROFILE
+// ─────────────────────────────────────────────
+
+model Intern {
+  id           String       @id @default(cuid())
+  userId       String       @unique
+  user         User         @relation("InternUser", fields: [userId], references: [id], onDelete: Cascade)
+  internId     String?      @unique // Auto-generated intern ID e.g. INT-2024-001
+  university   String?
+  course       String?
+  yearOfStudy  String?
+  address      String?
+  startDate    DateTime?
+  endDate      DateTime?
+  status       InternStatus @default(ACTIVE)
+
+  // Assigned manager
+  managerId  String?
+  manager    Manager?    @relation(fields: [managerId], references: [id], onDelete: SetNull)
+
+  // Department through manager
+  departmentId String?
+  department   Department? @relation(fields: [departmentId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("interns")
+}
+
+// ─────────────────────────────────────────────
+// DOCUMENT MASTER (admin defines required doc types)
+// ─────────────────────────────────────────────
+
+model DocumentType {
+  id          String  @id @default(cuid())
+  name        String  @unique
+  description String?
+  isRequired  Boolean @default(false)
+  isActive    Boolean @default(true)
+  acceptedFormats String? // e.g., "pdf,jpg,png"
+  maxSizeMb   Int?    @default(5)
+
+  documents Document[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("document_types")
+}
+
+// ─────────────────────────────────────────────
+// DOCUMENT (uploaded by intern / user)
+// ─────────────────────────────────────────────
+
+model Document {
+  id             String         @id @default(cuid())
+  userId         String
+  user           User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  documentTypeId String
+  documentType   DocumentType   @relation(fields: [documentTypeId], references: [id], onDelete: Cascade)
+  fileName       String
+  originalName   String
+  fileUrl        String
+  filePath       String
+  fileSize       Int?
+  mimeType       String?
+  status         DocumentStatus @default(PENDING)
+  rejectionReason String?
+  reviewedAt     DateTime?
+  reviewedBy     String? // user id of admin who reviewed
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("documents")
+}
