@@ -1,8 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
-import { prisma } from "@/lib/prisma";
+import { hasuraRequest } from "@/lib/hasura";
 import { createSupabaseAdmin } from "@/lib/supabase";
+import { REVIEW_DOCUMENT, GET_DOC_FOR_DELETE, DELETE_DOC } from "@/lib/graphql/queries";
 import { z } from "zod";
 
 const BUCKET = process.env.NEXT_PUBLIC_STORAGE_BUCKET ?? "intern-documents";
@@ -26,18 +27,41 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
     return NextResponse.json({ error: "Validation failed", details: parsed.error.flatten() }, { status: 422 });
   }
 
-  const doc = await prisma.document.update({
-    where: { id },
-    data: {
-      status: parsed.data.status,
-      rejectionReason: parsed.data.rejectionReason ?? null,
-      reviewedAt: new Date(),
-      reviewedBy: session.user.id,
-    },
-    include: { documentType: true, user: { select: { name: true, email: true } } },
-  });
+  const result = await hasuraRequest<{
+    update_documents_by_pk: {
+      id: string;
+      status: string;
+      rejectionReason: string | null;
+      reviewedAt: string | null;
+      reviewedBy: string | null;
+      document_type: { id: string; name: string };
+      user: { name: string; email: string };
+    } | null;
+  }>(
+    REVIEW_DOCUMENT,
+    {
+      id,
+      set: {
+        status: parsed.data.status,
+        rejectionReason: parsed.data.rejectionReason ?? null,
+        reviewedAt: new Date().toISOString(),
+        reviewedBy: session.user.id,
+      },
+    }
+  );
 
-  return NextResponse.json({ success: true, data: doc });
+  if (!result.update_documents_by_pk) {
+    return NextResponse.json({ error: "Not found" }, { status: 404 });
+  }
+
+  const doc = result.update_documents_by_pk;
+  return NextResponse.json({
+    success: true,
+    data: {
+      ...doc,
+      documentType: doc.document_type,
+    },
+  });
 }
 
 // DELETE /api/documents/[id] – delete document
@@ -46,17 +70,26 @@ export async function DELETE(_req: NextRequest, { params }: { params: Promise<{ 
   if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   const { id } = await params;
 
-  const doc = await prisma.document.findUnique({ where: { id } });
+  // Fetch the document
+  const docData = await hasuraRequest<{
+    documents_by_pk: { id: string; userId: string; filePath: string } | null;
+  }>(GET_DOC_FOR_DELETE, { id });
+  const doc = docData.documents_by_pk;
   if (!doc) return NextResponse.json({ error: "Not found" }, { status: 404 });
 
-  // Only admin or the owning user can delete
+  // Only admin or document owner can delete
   if (session.user.role !== "ADMIN" && doc.userId !== session.user.id) {
     return NextResponse.json({ error: "Forbidden" }, { status: 403 });
   }
 
   const supabase = createSupabaseAdmin();
   await supabase.storage.from(BUCKET).remove([doc.filePath]);
-  await prisma.document.delete({ where: { id } });
+
+  await hasuraRequest(
+    DELETE_DOC,
+    { id }
+  );
 
   return NextResponse.json({ success: true });
 }
+

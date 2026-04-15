@@ -1,6 +1,7 @@
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
-import { prisma } from "@/lib/prisma";
+import { hasuraRequest } from "@/lib/hasura";
+import { INTERN_DASHBOARD } from "@/lib/graphql/queries";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { formatDate } from "@/lib/utils";
@@ -14,23 +15,36 @@ export const metadata: Metadata = { title: "Intern Dashboard" };
 export default async function InternDashboard() {
   const session = await getServerSession(authOptions);
 
-  const internProfile = await prisma.intern.findUnique({
-    where: { userId: session!.user.id },
-    include: {
-      department: true,
-      manager: { include: { user: { select: { name: true, email: true } } } },
-    },
-  });
+  const data = await hasuraRequest<{
+    interns: Array<{
+      id: string;
+      internId: string | null;
+      status: string;
+      startDate: string | null;
+      endDate: string | null;
+      university: string | null;
+      department: { name: string } | null;
+      manager: { user: { name: string; email: string } } | null;
+    }>;
+    document_types: Array<{
+      id: string;
+      name: string;
+      isRequired: boolean;
+    }>;
+    documents: Array<{
+      id: string;
+      documentTypeId: string;
+      status: string;
+      document_type: { id: string; name: string; isRequired: boolean };
+    }>;
+  }>(
+    INTERN_DASHBOARD,
+    { userId: session!.user.id }
+  );
 
-  const docTypes = await prisma.documentType.findMany({
-    where: { isActive: true },
-    orderBy: [{ isRequired: "desc" }, { name: "asc" }],
-  });
-
-  const myDocs = await prisma.document.findMany({
-    where: { userId: session!.user.id },
-    include: { documentType: true },
-  });
+  const internProfile = data.interns[0] ?? null;
+  const docTypes = data.document_types;
+  const myDocs = data.documents;
 
   const uploadedTypeIds = new Set(myDocs.map((d) => d.documentTypeId));
   const requiredTypes = docTypes.filter((dt) => dt.isRequired);

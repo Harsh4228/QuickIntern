@@ -1,21 +1,40 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
-import { prisma } from "@/lib/prisma";
+import { hasuraRequest } from "@/lib/hasura";
 import { departmentSchema } from "@/lib/validations";
+import { GET_DEPARTMENTS, CHECK_DEPARTMENT, CREATE_DEPARTMENT } from "@/lib/graphql/queries";
 
 // GET /api/departments
 export async function GET(_req: NextRequest) {
   const session = await getServerSession(authOptions);
   if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
-  const departments = await prisma.department.findMany({
-    include: {
-      manager: { select: { id: true, name: true, email: true } },
-      _count: { select: { interns: true, managers: true } },
+  const data = await hasuraRequest<{
+    departments: Array<{
+      id: string;
+      name: string;
+      description: string | null;
+      isActive: boolean;
+      managerId: string | null;
+      manager: { id: string; name: string; email: string } | null;
+      interns_aggregate: { aggregate: { count: number } };
+      managers_aggregate: { aggregate: { count: number } };
+    }>;
+  }>(GET_DEPARTMENTS);
+
+  const departments = data.departments.map((d) => ({
+    id: d.id,
+    name: d.name,
+    description: d.description,
+    isActive: d.isActive,
+    managerId: d.managerId,
+    manager: d.manager,
+    _count: {
+      interns: d.interns_aggregate.aggregate.count,
+      managers: d.managers_aggregate.aggregate.count,
     },
-    orderBy: { name: "asc" },
-  });
+  }));
 
   return NextResponse.json({ data: departments });
 }
@@ -33,9 +52,24 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Validation failed", details: parsed.error.flatten() }, { status: 422 });
   }
 
-  const existing = await prisma.department.findUnique({ where: { name: parsed.data.name } });
-  if (existing) return NextResponse.json({ error: "Department already exists" }, { status: 409 });
+  // Check if department already exists
+  const existing = await hasuraRequest<{ departments: Array<{ id: string }> }>(
+    CHECK_DEPARTMENT,
+    { name: parsed.data.name }
+  );
+  if (existing.departments.length > 0) {
+    return NextResponse.json({ error: "Department already exists" }, { status: 409 });
+  }
 
-  const dept = await prisma.department.create({ data: parsed.data });
-  return NextResponse.json({ success: true, data: dept }, { status: 201 });
+  const result = await hasuraRequest<{ insert_departments_one: { id: string; name: string; description: string | null; isActive: boolean; createdAt: string } }>(
+    CREATE_DEPARTMENT,
+    { object: { name: parsed.data.name, description: parsed.data.description ?? null } }
+  );
+
+  const dept = result.insert_departments_one;
+  return NextResponse.json(
+    { success: true, data: { ...dept } },
+    { status: 201 }
+  );
 }
+

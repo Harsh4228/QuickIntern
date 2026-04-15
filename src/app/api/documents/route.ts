@@ -1,8 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
-import { prisma } from "@/lib/prisma";
+import { hasuraRequest } from "@/lib/hasura";
 import { createSupabaseAdmin } from "@/lib/supabase";
+import {
+  GET_DOCUMENTS, GET_DOC_TYPE_BY_PK, FIND_EXISTING_DOC,
+  DELETE_DOC, INSERT_DOCUMENT,
+} from "@/lib/graphql/queries";
 
 const BUCKET = process.env.NEXT_PUBLIC_STORAGE_BUCKET ?? "intern-documents";
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10 MB hard cap
@@ -16,25 +20,44 @@ export async function GET(req: NextRequest) {
   const userId = searchParams.get("userId");
   const status = searchParams.get("status");
 
-  let whereUserId: string | undefined;
+  const andConditions: Record<string, unknown>[] = [];
+
   if (session.user.role === "INTERN") {
-    // Interns can only see their own documents
-    whereUserId = session.user.id;
+    andConditions.push({ userId: { _eq: session.user.id } });
   } else if (userId) {
-    whereUserId = userId;
+    andConditions.push({ userId: { _eq: userId } });
   }
 
-  const docs = await prisma.document.findMany({
-    where: {
-      ...(whereUserId ? { userId: whereUserId } : {}),
-      ...(status ? { status: status as "PENDING" | "APPROVED" | "REJECTED" } : {}),
-    },
-    include: {
-      user: { select: { id: true, name: true, email: true } },
-      documentType: { select: { id: true, name: true, isRequired: true } },
-    },
-    orderBy: { createdAt: "desc" },
-  });
+  if (status) andConditions.push({ status: { _eq: status } });
+
+  const where = andConditions.length > 0 ? { _and: andConditions } : {};
+
+  const data = await hasuraRequest<{
+    documents: Array<{
+      id: string;
+      userId: string;
+      documentTypeId: string;
+      fileName: string;
+      originalName: string;
+      fileUrl: string;
+      filePath: string;
+      fileSize: number | null;
+      mimeType: string | null;
+      status: string;
+      rejectionReason: string | null;
+      reviewedAt: string | null;
+      reviewedBy: string | null;
+      createdAt: string;
+      user: { id: string; name: string; email: string };
+      document_type: { id: string; name: string; isRequired: boolean };
+    }>;
+  }>(GET_DOCUMENTS, { where });
+
+  // Reshape document_type → documentType to match frontend expectations
+  const docs = data.documents.map(({ document_type, ...d }) => ({
+    ...d,
+    documentType: document_type,
+  }));
 
   return NextResponse.json({ data: docs });
 }
@@ -47,7 +70,6 @@ export async function POST(req: NextRequest) {
   const formData = await req.formData();
   const file = formData.get("file") as File | null;
   const documentTypeId = formData.get("documentTypeId") as string | null;
-  // Admin can upload on behalf of another user
   const targetUserId = (formData.get("userId") as string | null) ?? session.user.id;
 
   if (!file || !documentTypeId) {
@@ -58,7 +80,10 @@ export async function POST(req: NextRequest) {
   }
 
   // Validate document type exists
-  const docType = await prisma.documentType.findUnique({ where: { id: documentTypeId } });
+  const docTypeData = await hasuraRequest<{
+    document_types_by_pk: { id: string; name: string; isRequired: boolean; acceptedFormats: string | null } | null;
+  }>(GET_DOC_TYPE_BY_PK, { id: documentTypeId });
+  const docType = docTypeData.document_types_by_pk;
   if (!docType) return NextResponse.json({ error: "Document type not found" }, { status: 404 });
 
   // Validate accepted formats
@@ -72,7 +97,6 @@ export async function POST(req: NextRequest) {
 
   const supabase = createSupabaseAdmin();
 
-  // Build safe file path: userId/docTypeId/timestamp-filename
   const timestamp = Date.now();
   const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, "_");
   const filePath = `${targetUserId}/${documentTypeId}/${timestamp}-${safeName}`;
@@ -92,29 +116,62 @@ export async function POST(req: NextRequest) {
 
   const { data: publicUrlData } = supabase.storage.from(BUCKET).getPublicUrl(filePath);
 
-  // Remove previous pending document of same type for this user (replace)
-  const existing = await prisma.document.findFirst({
-    where: { userId: targetUserId, documentTypeId, status: "PENDING" },
-  });
-  if (existing) {
-    await supabase.storage.from(BUCKET).remove([existing.filePath]);
-    await prisma.document.delete({ where: { id: existing.id } });
+  // Remove previous pending document of same type for this user
+  const existingDoc = await hasuraRequest<{
+    documents: Array<{ id: string; filePath: string }>;
+  }>(FIND_EXISTING_DOC, { userId: targetUserId, docTypeId: documentTypeId });
+
+  if (existingDoc.documents[0]) {
+    const prev = existingDoc.documents[0];
+    await supabase.storage.from(BUCKET).remove([prev.filePath]);
+    await hasuraRequest(
+      DELETE_DOC,
+      { id: prev.id }
+    );
   }
 
-  const doc = await prisma.document.create({
-    data: {
-      userId: targetUserId,
-      documentTypeId,
-      fileName: `${timestamp}-${safeName}`,
-      originalName: file.name,
-      fileUrl: publicUrlData.publicUrl,
-      filePath,
-      fileSize: file.size,
-      mimeType: file.type,
-      status: "PENDING",
-    },
-    include: { documentType: true },
-  });
+  // Insert new document record
+  const result = await hasuraRequest<{
+    insert_documents_one: {
+      id: string;
+      userId: string;
+      documentTypeId: string;
+      fileName: string;
+      originalName: string;
+      fileUrl: string;
+      filePath: string;
+      fileSize: number | null;
+      mimeType: string | null;
+      status: string;
+      createdAt: string;
+      document_type: { id: string; name: string };
+    };
+  }>(
+    INSERT_DOCUMENT,
+    {
+      object: {
+        userId: targetUserId,
+        documentTypeId,
+        fileName: `${timestamp}-${safeName}`,
+        originalName: file.name,
+        fileUrl: publicUrlData.publicUrl,
+        filePath,
+        fileSize: file.size,
+        mimeType: file.type,
+        status: "PENDING",
+      },
+    }
+  );
 
-  return NextResponse.json({ success: true, data: doc }, { status: 201 });
+  const doc = result.insert_documents_one;
+  return NextResponse.json(
+    {
+      success: true,
+      data: {
+        ...doc,
+        documentType: doc.document_type,
+      },
+    },
+    { status: 201 }
+  );
 }

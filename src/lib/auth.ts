@@ -1,6 +1,7 @@
 import { AuthOptions } from "next-auth";
 import CredentialsProvider from "next-auth/providers/credentials";
-import { prisma } from "@/lib/prisma";
+import { hasuraRequest } from "@/lib/hasura";
+import { GET_USER_BY_EMAIL } from "@/lib/graphql/queries";
 import bcrypt from "bcryptjs";
 import { loginSchema } from "@/lib/validations";
 
@@ -19,10 +20,21 @@ export const authOptions: AuthOptions = {
 
         const { email, password } = parsed.data;
 
-        const user = await prisma.user.findUnique({
-          where: { email: email.toLowerCase() },
-        });
+        const data = await hasuraRequest<{
+          users: Array<{
+            id: string;
+            email: string;
+            name: string;
+            password: string;
+            role: string;
+            isActive: boolean;
+          }>;
+        }>(
+          GET_USER_BY_EMAIL,
+          { email: email.toLowerCase() }
+        );
 
+        const user = data.users[0];
         if (!user || !user.isActive) return null;
 
         const isValid = await bcrypt.compare(password, user.password);

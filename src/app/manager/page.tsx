@@ -1,6 +1,7 @@
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
-import { prisma } from "@/lib/prisma";
+import { hasuraRequest } from "@/lib/hasura";
+import { MANAGER_DASHBOARD } from "@/lib/graphql/queries";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Users, FileText, Clock } from "lucide-react";
@@ -11,29 +12,26 @@ export const metadata: Metadata = { title: "Manager Dashboard" };
 
 export default async function ManagerDashboard() {
   const session = await getServerSession(authOptions);
-  const manager = await prisma.manager.findUnique({
-    where: { userId: session!.user.id },
-    include: {
-      department: true,
-      interns: {
-        include: {
-          user: { select: { name: true, email: true, isActive: true } },
-        },
-        orderBy: { createdAt: "desc" },
-      },
-    },
-  });
 
-  const pendingDocs = await prisma.document.count({
-    where: {
-      status: "PENDING",
-      user: {
-        internProfile: {
-          managerId: manager?.id,
-        },
-      },
-    },
-  });
+  const data = await hasuraRequest<{
+    managers: Array<{
+      id: string;
+      department: { name: string } | null;
+      interns: Array<{
+        id: string;
+        status: string;
+        startDate: string;
+        user: { name: string; email: string; isActive: boolean };
+      }>;
+    }>;
+    pendingDocs: { aggregate: { count: number } };
+  }>(
+    MANAGER_DASHBOARD,
+    { userId: session!.user.id }
+  );
+
+  const manager = data.managers[0] ?? null;
+  const pendingDocs = data.pendingDocs.aggregate.count;
 
   return (
     <div className="space-y-6">

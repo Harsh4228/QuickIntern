@@ -1,10 +1,15 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
-import { prisma } from "@/lib/prisma";
+import { hasuraRequest } from "@/lib/hasura";
 import { assignManagerSchema, assignInternSchema } from "@/lib/validations";
+import {
+  GET_MANAGER_BY_USER_ID, GET_MANAGER_BY_USER_ID_WITH_DEPT,
+  CLEAR_OLD_MANAGER_ASSIGNMENT, ASSIGN_MANAGER_TO_DEPT,
+  UPDATE_MANAGER_DEPT, ASSIGN_INTERN_TO_MANAGER,
+} from "@/lib/graphql/queries";
 
-// POST /api/assignments/manager – assign manager to department
+// POST /api/assignments
 export async function POST(req: NextRequest) {
   const session = await getServerSession(authOptions);
   if (!session || session.user.role !== "ADMIN") {
@@ -22,29 +27,33 @@ export async function POST(req: NextRequest) {
 
     const { departmentId, managerId } = parsed.data;
 
-    // Find manager record
-    const manager = await prisma.manager.findUnique({ where: { userId: managerId } });
-    if (!manager) return NextResponse.json({ error: "Manager not found" }, { status: 404 });
+    // Find manager record by userId
+    const mgrData = await hasuraRequest<{ managers: Array<{ id: string }> }>(
+      GET_MANAGER_BY_USER_ID,
+      { userId: managerId }
+    );
+    if (!mgrData.managers[0]) return NextResponse.json({ error: "Manager not found" }, { status: 404 });
+    const managerRecord = mgrData.managers[0];
 
-    // Clear old assignment for this manager
-    await prisma.department.updateMany({
-      where: { managerId },
-      data: { managerId: null },
-    });
+    // Clear old assignment for this manager from other departments
+    await hasuraRequest(
+      CLEAR_OLD_MANAGER_ASSIGNMENT,
+      { userId: managerId }
+    );
 
-    // Assign new
-    const [dept] = await Promise.all([
-      prisma.department.update({
-        where: { id: departmentId },
-        data: { managerId },
-      }),
-      prisma.manager.update({
-        where: { id: manager.id },
-        data: { departmentId },
-      }),
+    // Assign manager to the new department and update manager's department_id
+    const [deptResult] = await Promise.all([
+      hasuraRequest<{ update_departments_by_pk: { id: string; name: string } | null }>(
+        ASSIGN_MANAGER_TO_DEPT,
+        { deptId: departmentId, userId: managerId }
+      ),
+      hasuraRequest(
+        UPDATE_MANAGER_DEPT,
+        { id: managerRecord.id, deptId: departmentId }
+      ),
     ]);
 
-    return NextResponse.json({ success: true, data: dept });
+    return NextResponse.json({ success: true, data: deptResult.update_departments_by_pk });
   }
 
   if (type === "intern-manager") {
@@ -55,18 +64,28 @@ export async function POST(req: NextRequest) {
 
     const { internId, managerId, departmentId } = parsed.data;
 
-    const manager = await prisma.manager.findUnique({ where: { userId: managerId } });
-    if (!manager) return NextResponse.json({ error: "Manager not found" }, { status: 404 });
+    // Find manager record by userId
+    const mgrData = await hasuraRequest<{
+      managers: Array<{ id: string; department_id: string | null }>;
+    }>(
+      GET_MANAGER_BY_USER_ID_WITH_DEPT,
+      { userId: managerId }
+    );
+    if (!mgrData.managers[0]) return NextResponse.json({ error: "Manager not found" }, { status: 404 });
+    const managerRecord = mgrData.managers[0];
 
-    const intern = await prisma.intern.update({
-      where: { id: internId },
-      data: {
-        managerId: manager.id,
-        departmentId: departmentId ?? manager.departmentId ?? undefined,
-      },
-    });
+    const result = await hasuraRequest<{
+      update_interns_by_pk: { id: string; manager_id: string | null; department_id: string | null } | null;
+    }>(
+      ASSIGN_INTERN_TO_MANAGER,
+      {
+        id: internId,
+        managerId: managerRecord.id,
+        deptId: departmentId ?? managerRecord.department_id ?? null,
+      }
+    );
 
-    return NextResponse.json({ success: true, data: intern });
+    return NextResponse.json({ success: true, data: result.update_interns_by_pk });
   }
 
   return NextResponse.json({ error: "Invalid assignment type" }, { status: 400 });

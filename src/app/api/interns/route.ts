@@ -1,8 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
-import { prisma } from "@/lib/prisma";
+import { hasuraRequest } from "@/lib/hasura";
 import { registerInternSchema } from "@/lib/validations";
+import {
+  GET_MANAGER_BY_USER_ID, GET_INTERNS, CHECK_EMAIL, INTERN_COUNT,
+  CREATE_USER, CREATE_INTERN, GET_DEPT_NAME, GET_MGR_NAME,
+} from "@/lib/graphql/queries";
 import bcrypt from "bcryptjs";
 import { generateInternId } from "@/lib/utils";
 import { sendMail, internWelcomeEmail } from "@/lib/mailer";
@@ -19,44 +23,57 @@ export async function GET(req: NextRequest) {
   const managerId = searchParams.get("managerId");
   const departmentId = searchParams.get("departmentId");
 
-  const where: Record<string, unknown> = {};
+  const andConditions: Record<string, unknown>[] = [];
 
   // Managers can only see their own interns
   if (session.user.role === "MANAGER") {
-    const manager = await prisma.manager.findUnique({
-      where: { userId: session.user.id },
-    });
-    if (!manager) return NextResponse.json({ data: [], pagination: { page, pageSize, total: 0, totalPages: 0 } });
-    where.managerId = manager.id;
+    const mgrData = await hasuraRequest<{ managers: Array<{ id: string }> }>(
+      GET_MANAGER_BY_USER_ID,
+      { userId: session.user.id }
+    );
+    if (!mgrData.managers[0]) {
+      return NextResponse.json({ data: [], pagination: { page, pageSize, total: 0, totalPages: 0 } });
+    }
+    andConditions.push({ managerId: { _eq: mgrData.managers[0].id } });
   } else if (managerId) {
-    where.managerId = managerId;
+    andConditions.push({ managerId: { _eq: managerId } });
   }
 
-  if (departmentId) where.departmentId = departmentId;
+  if (departmentId) andConditions.push({ departmentId: { _eq: departmentId } });
 
-  const searchFilter = search
-    ? { user: { OR: [{ name: { contains: search, mode: "insensitive" as const } }, { email: { contains: search, mode: "insensitive" as const } }] } }
-    : {};
+  if (search) {
+    andConditions.push({
+      _or: [
+        { user: { name: { _ilike: `%${search}%` } } },
+        { user: { email: { _ilike: `%${search}%` } } },
+      ],
+    });
+  }
 
-  const [total, interns] = await Promise.all([
-    prisma.intern.count({
-      where: { ...where, ...searchFilter },
-    }),
-    prisma.intern.findMany({
-      where: { ...where, ...searchFilter },
-      include: {
-        user: { select: { id: true, name: true, email: true, phone: true, isActive: true, createdAt: true } },
-        department: { select: { id: true, name: true } },
-        manager: { include: { user: { select: { name: true, email: true } } } },
-      },
-      skip: (page - 1) * pageSize,
-      take: pageSize,
-      orderBy: { createdAt: "desc" },
-    }),
-  ]);
+  const where = andConditions.length > 0 ? { _and: andConditions } : {};
+  const offset = (page - 1) * pageSize;
+
+  const data = await hasuraRequest<{
+    interns_aggregate: { aggregate: { count: number } };
+    interns: Array<{
+      id: string;
+      userId: string;
+      managerId: string | null;
+      departmentId: string | null;
+      internId: string | null;
+      university: string | null;
+      course: string | null;
+      status: string;
+      user: { id: string; name: string; email: string; phone: string | null; isActive: boolean; createdAt: string };
+      department: { id: string; name: string } | null;
+      manager: { id: string; user: { name: string; email: string } } | null;
+    }>;
+  }>(GET_INTERNS, { where, limit: pageSize, offset });
+
+  const total = data.interns_aggregate.aggregate.count;
 
   return NextResponse.json({
-    data: interns,
+    data: data.interns,
     pagination: { page, pageSize, total, totalPages: Math.ceil(total / pageSize) },
   });
 }
@@ -76,51 +93,99 @@ export async function POST(req: NextRequest) {
 
   const { name, email, password, phone, university, course, yearOfStudy, address, startDate, endDate, departmentId, managerId } = parsed.data;
 
-  const existing = await prisma.user.findUnique({ where: { email: email.toLowerCase() } });
-  if (existing) {
+  // Check email uniqueness
+  const emailCheck = await hasuraRequest<{ users: Array<{ id: string }> }>(
+    CHECK_EMAIL,
+    { email: email.toLowerCase() }
+  );
+  if (emailCheck.users.length > 0) {
     return NextResponse.json({ error: "Email already in use" }, { status: 409 });
   }
 
   const hashedPassword = await bcrypt.hash(password, 12);
-  const internCount = await prisma.intern.count();
-  const internId = generateInternId(internCount);
 
-  const user = await prisma.user.create({
-    data: {
-      email: email.toLowerCase(),
-      password: hashedPassword,
-      name,
-      phone,
-      role: "INTERN",
-      internProfile: {
-        create: {
-          internId,
-          university,
-          course,
-          yearOfStudy,
-          address,
-          startDate: startDate ? new Date(startDate) : undefined,
-          endDate: endDate ? new Date(endDate) : undefined,
-          departmentId: departmentId || undefined,
-          managerId: managerId || undefined,
-        },
+  // Get intern count for ID generation
+  const countData = await hasuraRequest<{ interns_aggregate: { aggregate: { count: number } } }>(
+    INTERN_COUNT
+  );
+  const internId = generateInternId(countData.interns_aggregate.aggregate.count);
+
+  // Create user
+  const userResult = await hasuraRequest<{
+    insert_users_one: { id: string; email: string; name: string; phone: string | null; role: string };
+  }>(
+    CREATE_USER,
+    {
+      object: {
+        email: email.toLowerCase(),
+        password: hashedPassword,
+        name,
+        phone: phone ?? null,
+        role: "INTERN",
       },
-    },
-    include: { internProfile: { include: { department: true, manager: { include: { user: true } } } } },
-  });
+    }
+  );
+  const user = userResult.insert_users_one;
 
-  // Send welcome email with credentials
+  // Create intern profile
+  const internResult = await hasuraRequest<{
+    insert_interns_one: {
+      id: string;
+      internId: string | null;
+      departmentId: string | null;
+      managerId: string | null;
+    };
+  }>(
+    CREATE_INTERN,
+    {
+      object: {
+        userId: user.id,
+        internId,
+        university: university ?? null,
+        course: course ?? null,
+        yearOfStudy: yearOfStudy ?? null,
+        address: address ?? null,
+        startDate: startDate ?? null,
+        endDate: endDate ?? null,
+        departmentId: departmentId ?? null,
+        managerId: managerId ?? null,
+      },
+    }
+  );
+
+  // Fetch department/manager names for welcome email
+  let deptName: string | undefined;
+  let managerName: string | undefined;
+
+  if (departmentId) {
+    const deptData = await hasuraRequest<{ departments_by_pk: { name: string } | null }>(
+      GET_DEPT_NAME,
+      { id: departmentId }
+    );
+    deptName = deptData.departments_by_pk?.name;
+  }
+  if (managerId) {
+    const mgrData = await hasuraRequest<{ managers_by_pk: { user: { name: string } } | null }>(
+      GET_MGR_NAME,
+      { id: managerId }
+    );
+    managerName = mgrData.managers_by_pk?.user?.name;
+  }
+
   const baseUrl = process.env.NEXTAUTH_URL ?? "http://localhost:3000";
   const emailData = internWelcomeEmail({
     name,
     email: email.toLowerCase(),
-    password, // plain text – only sent once at creation
+    password,
     internId,
-    department: user.internProfile?.department?.name,
-    manager: user.internProfile?.manager?.user?.name,
+    department: deptName,
+    manager: managerName,
     loginUrl: `${baseUrl}/login`,
   });
   await sendMail({ to: email.toLowerCase(), ...emailData });
 
-  return NextResponse.json({ success: true, data: user }, { status: 201 });
+  return NextResponse.json(
+    { success: true, data: { ...user, internProfile: internResult.insert_interns_one } },
+    { status: 201 }
+  );
 }

@@ -1,6 +1,7 @@
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
-import { prisma } from "@/lib/prisma";
+import { hasuraRequest } from "@/lib/hasura";
+import { ADMIN_STATS } from "@/lib/graphql/queries";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Users, Building2, UserCheck, FileText, Clock, CheckCircle } from "lucide-react";
 import { formatDate } from "@/lib/utils";
@@ -9,30 +10,37 @@ import type { Metadata } from "next";
 export const metadata: Metadata = { title: "Admin Dashboard" };
 
 async function getStats() {
-  const [
-    totalInterns,
-    activeInterns,
-    totalManagers,
-    totalDepartments,
-    totalDocTypes,
-    pendingDocs,
-    recentInterns,
-  ] = await Promise.all([
-    prisma.intern.count(),
-    prisma.intern.count({ where: { status: "ACTIVE" } }),
-    prisma.manager.count(),
-    prisma.department.count(),
-    prisma.documentType.count(),
-    prisma.document.count({ where: { status: "PENDING" } }),
-    prisma.user.findMany({
-      where: { role: "INTERN" },
-      orderBy: { createdAt: "desc" },
-      take: 5,
-      include: { internProfile: { include: { department: true, manager: { include: { user: true } } } } },
-    }),
-  ]);
+  const data = await hasuraRequest<{
+    totalInterns: { aggregate: { count: number } };
+    activeInterns: { aggregate: { count: number } };
+    totalManagers: { aggregate: { count: number } };
+    totalDepartments: { aggregate: { count: number } };
+    totalDocTypes: { aggregate: { count: number } };
+    pendingDocs: { aggregate: { count: number } };
+    recentInterns: Array<{
+      id: string;
+      name: string;
+      email: string;
+      createdAt: string;
+      interns: Array<{
+        department: { name: string } | null;
+        manager: { user: { name: string } } | null;
+      }>;
+    }>;
+  }>(ADMIN_STATS);
 
-  return { totalInterns, activeInterns, totalManagers, totalDepartments, totalDocTypes, pendingDocs, recentInterns };
+  return {
+    totalInterns: data.totalInterns.aggregate.count,
+    activeInterns: data.activeInterns.aggregate.count,
+    totalManagers: data.totalManagers.aggregate.count,
+    totalDepartments: data.totalDepartments.aggregate.count,
+    totalDocTypes: data.totalDocTypes.aggregate.count,
+    pendingDocs: data.pendingDocs.aggregate.count,
+    recentInterns: data.recentInterns.map((u) => ({
+      ...u,
+      internProfile: u.interns[0] ?? null,
+    })),
+  };
 }
 
 export default async function AdminDashboard() {

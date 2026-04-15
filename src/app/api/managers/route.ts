@@ -1,8 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
-import { prisma } from "@/lib/prisma";
+import { hasuraRequest } from "@/lib/hasura";
 import { registerManagerSchema } from "@/lib/validations";
+import { GET_MANAGERS, CHECK_EMAIL, CREATE_USER, CREATE_MANAGER, SET_DEPARTMENT_MANAGER, GET_DEPT_NAME } from "@/lib/graphql/queries";
 import bcrypt from "bcryptjs";
 import { sendMail, managerWelcomeEmail } from "@/lib/mailer";
 
@@ -15,22 +16,37 @@ export async function GET(req: NextRequest) {
   const search = searchParams.get("search") ?? "";
   const departmentId = searchParams.get("departmentId");
 
-  const where: Record<string, unknown> = {};
-  if (departmentId) where.departmentId = departmentId;
+  // Build the where clause dynamically
+  const andConditions: Record<string, unknown>[] = [];
+  if (departmentId) {
+    andConditions.push({ departmentId: { _eq: departmentId } });
+  }
+  if (search) {
+    andConditions.push({
+      _or: [
+        { user: { name: { _ilike: `%${search}%` } } },
+        { user: { email: { _ilike: `%${search}%` } } },
+      ],
+    });
+  }
+  const where = andConditions.length > 0 ? { _and: andConditions } : {};
 
-  const searchFilter = search
-    ? { user: { OR: [{ name: { contains: search, mode: "insensitive" as const } }, { email: { contains: search, mode: "insensitive" as const } }] } }
-    : {};
+  const data = await hasuraRequest<{
+    managers: Array<{
+      id: string;
+      userId: string;
+      designation: string | null;
+      departmentId: string | null;
+      user: { id: string; name: string; email: string; phone: string | null; isActive: boolean; createdAt: string };
+      department: { id: string; name: string } | null;
+      interns_aggregate: { aggregate: { count: number } };
+    }>;
+  }>(GET_MANAGERS, { where });
 
-  const managers = await prisma.manager.findMany({
-    where: { ...where, ...searchFilter },
-    include: {
-      user: { select: { id: true, name: true, email: true, phone: true, isActive: true, createdAt: true } },
-      department: { select: { id: true, name: true } },
-      _count: { select: { interns: true } },
-    },
-    orderBy: { createdAt: "desc" },
-  });
+  const managers = data.managers.map((m) => ({
+    ...m,
+    _count: { interns: m.interns_aggregate.aggregate.count },
+  }));
 
   return NextResponse.json({ data: managers });
 }
@@ -50,48 +66,79 @@ export async function POST(req: NextRequest) {
 
   const { name, email, password, phone, designation, departmentId } = parsed.data;
 
-  const existing = await prisma.user.findUnique({ where: { email: email.toLowerCase() } });
-  if (existing) return NextResponse.json({ error: "Email already in use" }, { status: 409 });
+  // Check email uniqueness
+  const emailCheck = await hasuraRequest<{ users: Array<{ id: string }> }>(
+    CHECK_EMAIL,
+    { email: email.toLowerCase() }
+  );
+  if (emailCheck.users.length > 0) {
+    return NextResponse.json({ error: "Email already in use" }, { status: 409 });
+  }
 
   const hashedPassword = await bcrypt.hash(password, 12);
 
-  const user = await prisma.user.create({
-    data: {
-      email: email.toLowerCase(),
-      password: hashedPassword,
-      name,
-      phone,
-      role: "MANAGER",
-      managerProfile: {
-        create: {
-          designation,
-          departmentId: departmentId || undefined,
-        },
+  // Create user
+  const userResult = await hasuraRequest<{
+    insert_users_one: { id: string; email: string; name: string; phone: string | null; role: string };
+  }>(
+    CREATE_USER,
+    {
+      object: {
+        email: email.toLowerCase(),
+        password: hashedPassword,
+        name,
+        phone: phone ?? null,
+        role: "MANAGER",
       },
-    },
-    include: { managerProfile: { include: { department: true } } },
-  });
+    }
+  );
+  const user = userResult.insert_users_one;
 
-  // If department assigned, update the department's managerId
+  // Create manager profile
+  const managerResult = await hasuraRequest<{
+    insert_managers_one: { id: string; userId: string; designation: string | null; departmentId: string | null };
+  }>(
+    CREATE_MANAGER,
+    {
+      object: {
+        userId: user.id,
+        designation: designation ?? null,
+        departmentId: departmentId ?? null,
+      },
+    }
+  );
+
+  // If department assigned, update the department's manager_id
   if (departmentId) {
-    await prisma.department.update({
-      where: { id: departmentId },
-      data: { managerId: user.id },
-    });
+    await hasuraRequest(
+      SET_DEPARTMENT_MANAGER,
+      { deptId: departmentId, userId: user.id }
+    );
   }
 
-  // Send welcome email with credentials
+  // Fetch department name for the welcome email
+  let deptName: string | undefined;
+  if (departmentId) {
+    const deptData = await hasuraRequest<{ departments_by_pk: { name: string } | null }>(
+      GET_DEPT_NAME,
+      { id: departmentId }
+    );
+    deptName = deptData.departments_by_pk?.name;
+  }
+
   const baseUrl = process.env.NEXTAUTH_URL ?? "http://localhost:3000";
-  const dept = user.managerProfile?.department;
   const emailData = managerWelcomeEmail({
     name,
     email: email.toLowerCase(),
-    password, // plain text – only sent once at creation
-    department: dept?.name,
-    designation: designation,
+    password,
+    department: deptName,
+    designation,
     loginUrl: `${baseUrl}/login`,
   });
   await sendMail({ to: email.toLowerCase(), ...emailData });
 
-  return NextResponse.json({ success: true, data: user }, { status: 201 });
+  return NextResponse.json(
+    { success: true, data: { ...user, managerProfile: managerResult.insert_managers_one } },
+    { status: 201 }
+  );
 }
